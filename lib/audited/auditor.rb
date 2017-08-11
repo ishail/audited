@@ -15,6 +15,8 @@ module Audited
     extend ActiveSupport::Concern
 
     CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
+    LOG_NAMESPACE = "audited_custom_logs"
+    REQUEST_SOURCE_MAP = {undefined: "0", console: "1", rake: "2", web_request: "3"}
 
     module ClassMethods
       # == Configuration options
@@ -221,7 +223,47 @@ module Audited
       def write_audit(attrs)
         attrs[:associated] = send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
-        run_callbacks(:audit)  { audits.create(attrs) } if auditing_enabled
+        # run_callbacks(:audit)  { audits.create(attrs) } if auditing_enabled
+        CustomLogger.log LOG_NAMESPACE, to_document(attrs)
+      end
+
+      def to_document(attrs)
+        env = (Audited.store[:current_controller] ? Audited.store[:current_controller].env : nil) || {}
+        controller_info = env["action_dispatch.request.path_parameters"] || {}
+
+        user = Audited.store[:audited_user] || Audited.store[:current_user].try!(:call)
+        user_id = user.nil? ? -1 : user.id
+        source =
+          if defined?(Rails::Server)
+            REQUEST_SOURCE_MAP[:web_request]
+          elsif File.basename($0) == 'rake'
+            REQUEST_SOURCE_MAP[:rake]
+          elsif defined?(Rails::Console)
+            REQUEST_SOURCE_MAP[:console]
+          else
+            REQUEST_SOURCE_MAP[:undefined]
+          end
+
+        {
+          aid: Audited.audit_class.audited_class_names.find_index(self.class.name) + 1,
+          atp: self.class.name,
+          uid: user_id,
+          ac: attrs[:action],
+          cc: attrs[:audited_changes].keys,
+          mc: attrs[:audited_changes],
+          cm: attrs[:comment],
+          ra: Audited.store[:current_remote_address],
+          rid: Audited.store[:current_request_uuid],
+          c_at: Time.now.utc,
+          ref: env["HTTP_REFERER"],
+          path: env["REQUEST_PATH"],
+          mtd: env["REQUEST_METHOD"],
+          cr: controller_info[:controller],
+          cr_ac: controller_info[:action],
+          su_id: env["ADMIN_USER"],
+          src: source,
+          addi: {}
+        }
       end
 
       def require_comment
