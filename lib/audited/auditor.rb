@@ -15,8 +15,7 @@ module Audited
     extend ActiveSupport::Concern
 
     CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
-    LOG_NAMESPACE = "audited_custom_logs"
-    REQUEST_SOURCE_MAP = {undefined: "0", console: "1", rake: "2", web_request: "3"}
+    REQUEST_SOURCE_MAP = {undefined: "0", console: "1", rake: "2", rails_server: "3", production: "4"}
 
     module ClassMethods
       # == Configuration options
@@ -73,7 +72,7 @@ module Audited
         extend Audited::Auditor::AuditedClassMethods
         include Audited::Auditor::AuditedInstanceMethods
 
-        self.auditing_enabled = true
+        self.auditing_enabled = Audited.auditing_enabled
       end
 
       def has_associated_audits
@@ -142,6 +141,14 @@ module Audited
 
       def non_audited_columns
         self.class.non_audited_columns
+      end
+
+      def audited_ignored_columns
+        self.class.audited_ignored_columns
+      end
+
+      def audited_encrypted_columns
+        self.class.audited_encrypted_columns
       end
 
       def revision_with(attributes)
@@ -223,8 +230,12 @@ module Audited
       def write_audit(attrs)
         attrs[:associated] = send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
-        # run_callbacks(:audit)  { audits.create(attrs) } if auditing_enabled
-        CustomLogger.log LOG_NAMESPACE, to_document(attrs)
+        if Audited.store[:doc_callback]
+          Audited.store[:audit_doc] = to_document(attrs)
+          Audited.store[:doc_callback].try!(:call)
+        else
+          run_callbacks(:audit)  { audits.create(attrs) } if auditing_enabled
+        end
       end
 
       def to_document(attrs)
@@ -233,16 +244,19 @@ module Audited
 
         user = Audited.store[:audited_user] || Audited.store[:current_user].try!(:call)
         user_id = user.nil? ? -1 : user.id
-        source =
-          if defined?(Rails::Server)
-            REQUEST_SOURCE_MAP[:web_request]
-          elsif File.basename($0) == 'rake'
-            REQUEST_SOURCE_MAP[:rake]
-          elsif defined?(Rails::Console)
-            REQUEST_SOURCE_MAP[:console]
-          else
-            REQUEST_SOURCE_MAP[:undefined]
-          end
+
+        source = case
+        when File.basename($0).include?("unicorn")
+          REQUEST_SOURCE_MAP[:production]
+        when File.basename($0).include?("rake")
+          REQUEST_SOURCE_MAP[:rake]
+        when defined?(Rails::Console)
+          REQUEST_SOURCE_MAP[:console]
+        when defined?(Rails::Server)
+          REQUEST_SOURCE_MAP[:rails_server]
+        else
+          REQUEST_SOURCE_MAP[:undefined]
+        end
 
         {
           aid: Audited.audit_class.audited_class_names.find_index(self.class.name) + 1,
@@ -250,7 +264,7 @@ module Audited
           uid: user_id,
           ac: attrs[:action],
           cc: attrs[:audited_changes].keys,
-          mc: attrs[:audited_changes],
+          mc: process_audited_changes(attrs),
           cm: attrs[:comment],
           ra: Audited.store[:current_remote_address],
           rid: Audited.store[:current_request_uuid],
@@ -264,6 +278,20 @@ module Audited
           src: source,
           addi: {}
         }
+      end
+
+      def process_audited_changes(attrs)
+        model_changes = attrs[:audited_changes].except(*audited_ignored_columns)
+
+        audited_encrypted_columns.each do |column|
+          next if model_changes[column].blank?
+
+          prev_value = Audited::Helper.encrypt_audited_column(model_changes[column].first, Audited.audit_encryption_salt)
+          curr_value = Audited::Helper.encrypt_audited_column(model_changes[column].second, Audited.audit_encryption_salt)
+          model_changes[column] = [prev_value, curr_value]
+        end
+
+        model_changes
       end
 
       def require_comment
@@ -311,6 +339,26 @@ module Audited
 
       def non_audited_columns=(columns)
         @non_audited_columns = columns
+      end
+
+      def audited_ignored_columns
+        @audited_ignored_columns ||= begin
+          ignored = []
+          if audited_options[:ignore_values]
+            ignored = Array.wrap(audited_options[:ignore_values]).flatten.map(&:to_s)
+          end
+          ignored
+        end
+      end
+
+      def audited_encrypted_columns
+        @audited_encrypted_columns ||= begin
+          encrypted = []
+          if audited_options[:encrypt_values]
+            encrypted = Array.wrap(audited_options[:encrypt_values]).flatten.map(&:to_s)
+          end
+          encrypted
+        end
       end
 
       # Executes the block with auditing disabled.
